@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alto Golf - データのバックアップ</title>
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #F5F5F7;
+    font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+    color: #1D1D1F;
+  }
+  .wrap { max-width: 480px; margin: 0 auto; padding: 24px 20px 40px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { font-size: 13px; color: #6E6E73; margin: 0 0 24px; }
+  .card {
+    background: #fff; border-radius: 16px; padding: 18px;
+    margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .card h2 { font-size: 15px; margin: 0 0 8px; }
+  .card p { font-size: 13px; line-height: 1.7; color: #444; margin: 0 0 14px; }
+  button {
+    width: 100%; border: none; border-radius: 12px; padding: 13px;
+    font-size: 15px; font-weight: 700; cursor: pointer;
+    font-family: inherit;
+  }
+  .primary { background: #2E7D55; color: #fff; }
+  .secondary { background: #F5F5F7; color: #1D1D1F; }
+  input[type="file"] { display: none; }
+  .status { font-size: 13px; margin-top: 10px; line-height: 1.6; white-space: pre-wrap; }
+  .status.ok { color: #2E7D55; }
+  .status.err { color: #D9534F; }
+  .count { font-size: 13px; color: #6E6E73; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Alto Golf データのバックアップ</h1>
+  <p class="sub">このページは練習記録の保存・復元専用です。アプリ本体とは別ファイルですが、同じブラウザ・同じサイト(altobeats1217.github.io)上で開けば同じデータを読み書きします。</p>
+
+  <div class="card">
+    <h2>今のデータを確認</h2>
+    <div id="current-count" class="count">読み込み中…</div>
+  </div>
+
+  <div class="card">
+    <h2>バックアップを保存する</h2>
+    <p>今ブラウザに保存されている練習記録を、ファイルとしてダウンロードします。アップデート前にここで保存しておくと安心です。</p>
+    <button class="primary" id="export-btn">バックアップをダウンロード</button>
+    <div id="export-status" class="status"></div>
+  </div>
+
+  <div class="card">
+    <h2>バックアップから復元する</h2>
+    <p>ダウンロードしておいたバックアップファイルを選んで読み込むと、このブラウザの記録に復元(上書き)します。</p>
+    <button class="secondary" id="import-trigger-btn">バックアップファイルを選ぶ</button>
+    <input type="file" id="import-file" accept="application/json,.json">
+    <div id="import-status" class="status"></div>
+  </div>
+</div>
+
+<script>
+  const SESSIONS_KEY = 'practice-sessions';
+  const CLUBS_KEY = 'custom-clubs';
+
+  function loadLocal(key, fallback) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function refreshCount() {
+    const sessions = loadLocal(SESSIONS_KEY, []);
+    const el = document.getElementById('current-count');
+    if (!Array.isArray(sessions) || sessions.length === 0) {
+      el.textContent = '保存されている練習記録: 0件';
+    } else {
+      const dates = sessions.map(s => s.date).sort();
+      el.textContent = `保存されている練習記録: ${sessions.length}件 (${dates[0]} 〜 ${dates[dates.length - 1]})`;
+    }
+  }
+  refreshCount();
+
+  document.getElementById('export-btn').addEventListener('click', () => {
+    const statusEl = document.getElementById('export-status');
+    try {
+      const payload = {
+        type: 'alto-golf-backup',
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        sessions: loadLocal(SESSIONS_KEY, []),
+        customClubs: loadLocal(CLUBS_KEY, []),
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const stamp = new Date().toISOString().slice(0, 10);
+      a.href = url;
+      a.download = `alto-golf-backup-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      statusEl.className = 'status ok';
+      statusEl.textContent = `${payload.sessions.length}件の記録をダウンロードしました。`;
+    } catch (err) {
+      statusEl.className = 'status err';
+      statusEl.textContent = 'エラー: ' + (err && err.message ? err.message : String(err));
+    }
+  });
+
+  document.getElementById('import-trigger-btn').addEventListener('click', () => {
+    document.getElementById('import-file').click();
+  });
+
+  document.getElementById('import-file').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    const statusEl = document.getElementById('import-status');
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!data || data.type !== 'alto-golf-backup' || !Array.isArray(data.sessions)) {
+          throw new Error('このファイルはAlto Golfのバックアップ形式ではないようです。');
+        }
+        const existing = loadLocal(SESSIONS_KEY, []);
+        const proceed = existing.length === 0 || window.confirm(
+          `現在 ${existing.length}件の記録があります。バックアップの ${data.sessions.length}件で上書きしますか?この操作は取り消せません。`
+        );
+        if (!proceed) {
+          statusEl.className = 'status';
+          statusEl.textContent = 'キャンセルしました。';
+          return;
+        }
+        localStorage.setItem(SESSIONS_KEY, JSON.stringify(data.sessions));
+        if (Array.isArray(data.customClubs)) {
+          localStorage.setItem(CLUBS_KEY, JSON.stringify(data.customClubs));
+        }
+        statusEl.className = 'status ok';
+        statusEl.textContent = `${data.sessions.length}件の記録を復元しました。`;
+        refreshCount();
+      } catch (err) {
+        statusEl.className = 'status err';
+        statusEl.textContent = 'エラー: ' + (err && err.message ? err.message : String(err));
+      }
+    };
+    reader.onerror = () => {
+      statusEl.className = 'status err';
+      statusEl.textContent = 'ファイルの読み込みに失敗しました。';
+    };
+    reader.readAsText(file);
+  });
+</script>
+</body>
+</html>
