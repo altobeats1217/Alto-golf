@@ -167,6 +167,35 @@ const RESULT_TYPES = [
   { key: 'shank', label: 'シャンク', points: 0 },
 ];
 
+// Distance-specific result types (different from club shot types)
+const DIST_RESULT_TYPES = [
+  { key: 'nice',    label: 'ナイス',         points: 100 },
+  { key: 'short',   label: 'ショート',        points: 40  },
+  { key: 'over',    label: 'オーバー',        points: 40  },
+  { key: 'left',    label: '左ミス',          points: 55  },
+  { key: 'right',   label: '右ミス',          points: 55  },
+  { key: 'contact', label: 'ザックリ/トップ', points: 10  },
+];
+const DIST_MISS_KEYS = ['short', 'over', 'left', 'right', 'contact'];
+const DIST_RESULT_LABELS = Object.fromEntries(DIST_RESULT_TYPES.map(t => [t.key, t.label]));
+
+const DISTANCE_PRESETS = [30, 40, 50, 60, 70, 80, 90, 100];
+
+function emptyDistCounts() {
+  const c = {};
+  DIST_RESULT_TYPES.forEach(t => { c[t.key] = 0; });
+  return c;
+}
+function totalDistCount(counts) {
+  if (!counts) return 0;
+  return DIST_RESULT_TYPES.reduce((s, t) => s + (counts[t.key] || 0), 0);
+}
+function computeDistScore(counts) {
+  const total = totalDistCount(counts);
+  if (total === 0) return null;
+  return DIST_RESULT_TYPES.reduce((s, t) => s + (counts[t.key] || 0) * t.points, 0) / total;
+}
+
 const FONT_STACK = "-apple-system, 'SF Pro Text', 'Hiragino Sans', 'Noto Sans JP', sans-serif";
 const FONT_ROUNDED = "-apple-system, 'SF Pro Rounded', 'Hiragino Sans', 'Noto Sans JP', sans-serif";
 
@@ -203,6 +232,19 @@ function mergeClubResults(clubsA, clubsB) {
       counts[t.key] = (clubsA[club]?.[t.key] || 0) + (clubsB[club]?.[t.key] || 0);
     });
     merged[club] = { ...counts, score: computeClubScore(counts) };
+  });
+  return merged;
+}
+
+function mergeDistResults(distsA, distsB) {
+  const merged = {};
+  const allDists = new Set([...Object.keys(distsA), ...Object.keys(distsB)]);
+  allDists.forEach((dist) => {
+    const counts = emptyDistCounts();
+    DIST_RESULT_TYPES.forEach((t) => {
+      counts[t.key] = (distsA[dist]?.[t.key] || 0) + (distsB[dist]?.[t.key] || 0);
+    });
+    merged[dist] = { ...counts, score: computeDistScore(counts) };
   });
   return merged;
 }
@@ -422,14 +464,20 @@ function getHomeAltoState(sessions) {
 // specific club when it's a clear outlier relative to the rest of the day.
 function getResultAltoState(session) {
   const clubEntries = Object.entries(session.clubs);
-  const overall = clubEntries.length
+  const distEntries = Object.entries(session.distances || {});
+  const hasClubs = clubEntries.length > 0;
+  const hasDists = distEntries.length > 0;
+
+  // Compute overall from clubs (primary metric for mood)
+  const clubOverall = hasClubs
     ? clubEntries.reduce((sum, [, c]) => sum + c.score, 0) / clubEntries.length
-    : 0;
+    : null;
+  const distOverall = hasDists
+    ? distEntries.reduce((sum, [, c]) => sum + c.score, 0) / distEntries.length
+    : null;
+  const overall = clubOverall !== null ? clubOverall : (distOverall || 0);
 
-  if (clubEntries.length === 0) {
-    return { mood: 'okay', message: 'お疲れさま!次の練習も待ってるよ。' };
-  }
-
+  // Club miss analysis
   const sessionTotals = emptyCounts();
   clubEntries.forEach(([, c]) => { RESULT_TYPES.forEach((t) => { sessionTotals[t.key] += c[t.key] || 0; }); });
   const totalShots = totalCount(sessionTotals);
@@ -437,37 +485,91 @@ function getResultAltoState(session) {
   const topMiss = dominantMiss(sessionTotals);
   const topMissShare = topMiss && totalShots > 0 ? sessionTotals[topMiss] / totalShots : 0;
 
-  // Only call out a club if it's a clear outlier vs. the rest of the day.
-  let outlierClub = null, outlierScore = 101;
-  if (clubEntries.length >= 2) {
-    clubEntries.forEach(([club, c]) => {
-      const others = clubEntries.filter(([c2]) => c2 !== club);
-      const avgOfRest = others.reduce((sum, [, oc]) => sum + oc.score, 0) / others.length;
-      if (c.score < avgOfRest - 20 && c.score < outlierScore) { outlierScore = c.score; outlierClub = club; }
-    });
-  }
+  // Distance miss analysis
+  const distTotals = emptyDistCounts();
+  distEntries.forEach(([, c]) => { DIST_RESULT_TYPES.forEach((t) => { distTotals[t.key] += c[t.key] || 0; }); });
+  const distTotal = totalDistCount(distTotals);
+  const distNiceRate = distTotal > 0 ? distTotals.nice / distTotal : 0;
+  const topDistMiss = DIST_MISS_KEYS.reduce((best, k) => {
+    return (!best || distTotals[k] > distTotals[best]) ? k : best;
+  }, null);
 
+  // Best and weakest club
+  let bestClub = null, bestScore = -1, weakClub = null, weakScore = 101;
+  clubEntries.forEach(([club, c]) => {
+    if (c.score > bestScore) { bestScore = c.score; bestClub = club; }
+    if (c.score < weakScore) { weakScore = c.score; weakClub = club; }
+  });
+
+  // Distance range with best/worst score
+  let bestDist = null, bestDistScore = -1;
+  distEntries.forEach(([dist, c]) => {
+    if (c.score > bestDistScore) { bestDistScore = c.score; bestDist = dist; }
+  });
+
+  // ---- HAPPY (80+) ----
   if (overall >= 80) {
-    if (niceRate >= 0.65) {
-      return { mood: 'happy', message: 'ナイスラウンド!ナイスショットの割合がとても高かったね。絶好調だ!' };
-    }
-    return { mood: 'happy', message: 'ナイスラウンド!絶好調だね!' };
+    const messages = [
+      bestClub && bestScore >= 90
+        ? `最高の練習だった!特に${bestClub}は絶好調。この感覚、忘れないうちに次のラウンドに活かそう🏌️`
+        : `今日は本当にいい球が多かったね。ナイスショット率${Math.round(niceRate * 100)}%、素晴らしい!`,
+      hasDists && bestDist
+        ? `クラブも距離感も冴えてた!${bestDist}yのコントロールは特に良かったよ。`
+        : `ナイスショットが連発できた日。このリズムをキープして、次のラウンドも楽しもう!`,
+    ];
+    return { mood: 'happy', message: messages[Math.floor(Date.now() / 1000) % messages.length] };
   }
 
+  // ---- OKAY (60-79) ----
   if (overall >= 60) {
-    if (outlierClub) {
-      return { mood: 'okay', message: `いい感じ!全体的には良かったけど、${outlierClub}だけ少し苦戦してたね。次回そこを意識してみよう。` };
+    if (hasDists && distNiceRate < 0.4 && topDistMiss) {
+      const distMissLabel = DIST_RESULT_LABELS[topDistMiss];
+      return {
+        mood: 'okay',
+        message: `クラブはまずまず良かったよ。距離感の練習では${distMissLabel}が目立ったから、次はそこをテーマにしてみよう。一歩ずつ確実に上手くなってる!`,
+      };
     }
-    return { mood: 'okay', message: 'いい感じ!この調子で次も頑張ろう。' };
+    if (topMiss && topMissShare >= 0.25 && weakClub) {
+      return {
+        mood: 'okay',
+        message: `全体的には悪くなかった!${weakClub}の${RESULT_LABELS[topMiss]}をもう少し減らせると、スコアがぐっと変わってくるよ。次回ここを意識して練習しよう。`,
+      };
+    }
+    if (niceRate >= 0.5) {
+      return {
+        mood: 'okay',
+        message: `ナイスショットが半分以上出てる!あと一歩でもっと安定してくるはず。コツをつかみかけてるよ、この調子で続けよう。`,
+      };
+    }
+    return {
+      mood: 'okay',
+      message: `いい練習だったよ。細かいミスはあったけど、着実に積み上がってる。継続が一番の近道!`,
+    };
   }
 
-  if (topMiss && topMissShare >= 0.3) {
-    return { mood: 'encourage', message: `今日は${RESULT_LABELS[topMiss]}が多かったね。クラブを問わず出てたから、次の練習はそこから一緒に直していこう。` };
+  // ---- ENCOURAGE (<60) ----
+  if (hasDists && distTotal > 0 && distNiceRate >= 0.4) {
+    return {
+      mood: 'encourage',
+      message: `クラブの調子は今日は苦しかったけど、距離感の感覚は良かったよ!アプローチが安定してくると、スコアはぐっと変わる。そこは自信にしていいよ。`,
+    };
   }
-  if (outlierClub) {
-    return { mood: 'encourage', message: `今日は${outlierClub}が特に苦戦してたね。次回はそこを中心に見直してみよう。` };
+  if (topMiss === 'shank') {
+    return {
+      mood: 'encourage',
+      message: `シャンクが出る日はあるよ。プロだって経験することだし、むしろ今日出し切ったと思おう。次は思い切って振り抜くことだけを意識してみて!`,
+    };
   }
-  return { mood: 'encourage', message: '次はもっと良くなるよ。一緒に頑張ろう!' };
+  if (topMiss && topMissShare >= 0.35) {
+    return {
+      mood: 'encourage',
+      message: `今日は${RESULT_LABELS[topMiss]}が出やすかったね。でも「何が出やすいか」が分かったこと自体が収穫。次の練習でそこだけ集中してやってみよう。絶対変わるよ!`,
+    };
+  }
+  return {
+    mood: 'encourage',
+    message: `今日の練習も無駄にならない。記録をつけ続けることが、気づかないうちに一番の上達につながってるよ。次も一緒に頑張ろう!`,
+  };
 }
 
 // ---------- shared styles ----------
@@ -773,6 +875,293 @@ function ClubTendencyHeatmap({ clubCounts }) {
   );
 }
 
+// Distance tendency visualization: a top-down "landing zone" view per
+// distance, showing where shots tend to land (nice = center green,
+// short = below, over = above, left/right = sides, contact = scattered).
+// Each distance gets its own mini circle map. The dot density + color
+// give an immediate read of how many shots and how well-controlled.
+const DIST_DOT_POSITIONS = {
+  nice:    { x: 0,     y: 0    },
+  short:   { x: 0,     y: 0.62 },
+  over:    { x: 0,     y: -0.62},
+  left:    { x: -0.62, y: 0    },
+  right:   { x: 0.62,  y: 0    },
+  contact: { x: 0,     y: 0.35 },
+};
+const DIST_DOT_COLORS = {
+  nice: '#2E7D55', short: '#E8A93B', over: '#5B7A8C',
+  left: '#A8503A', right: '#9C4A8A', contact: '#D9534F',
+};
+
+function DistanceTendencyMap({ distCounts, sessions = [] }) {
+  const [activeDist, setActiveDist] = useState(null);
+  const [activeTab, setActiveTab] = useState('all'); // 'all' | 'timeline'
+
+  const entries = Object.entries(distCounts)
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .filter(([, c]) => totalDistCount(c) >= 2);
+
+  if (entries.length === 0) return null;
+
+  const R = 38, CX = 50, CY = 50, SIZE = 100, DOT_R = 5;
+
+  function buildDots(counts, seed0 = 1) {
+    const dots = [];
+    let seed = seed0;
+    function jitter() { seed = (seed * 1664525 + 1013904223) & 0xffffffff; return ((seed >>> 0) / 0xffffffff - 0.5) * 0.22; }
+    DIST_RESULT_TYPES.forEach((rt) => {
+      const n = counts[rt.key] || 0;
+      if (n === 0) return;
+      const pos = DIST_DOT_POSITIONS[rt.key];
+      for (let i = 0; i < n; i++) {
+        const spread = n === 1 ? 0 : (i / (n - 1) - 0.5) * 0.28 + jitter();
+        dots.push({
+          x: CX + (pos.x + spread) * R,
+          y: CY + (pos.y + (n === 1 ? 0 : jitter() * 0.15)) * R,
+          color: DIST_DOT_COLORS[rt.key],
+        });
+      }
+    });
+    return dots;
+  }
+
+  // Per-session data for the active distance, sorted oldest→newest
+  const sessionHistory = useMemo(() => {
+    if (activeDist === null) return [];
+    const dkey = String(activeDist);
+    return sessions
+      .filter((s) => s.distances && s.distances[dkey] && totalDistCount(s.distances[dkey]) >= 1)
+      .sort((a, b) => a.date.localeCompare(b.date))
+      .map((s) => ({
+        date: s.date,
+        label: formatDateShort(s.date),
+        counts: s.distances[dkey],
+        score: s.distances[dkey].score ?? computeDistScore(s.distances[dkey]),
+      }));
+  }, [activeDist, sessions]);
+
+  const active = activeDist !== null ? entries.find(([d]) => d === String(activeDist)) : null;
+  const activeCounts = active ? active[1] : null;
+
+  // Mini green SVG (shared between grid and timeline views)
+  function MiniGreen({ counts, size = SIZE, seed = 1, showLabels = false }) {
+    const dots = buildDots(counts, seed);
+    const rScale = (size / SIZE);
+    const r = R * rScale, cx = size / 2, cy = size / 2;
+    const dr = DOT_R * rScale * 0.85;
+    return (
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <circle cx={cx} cy={cy} r={r + 8 * rScale} fill="#C8E6C0" />
+        <circle cx={cx} cy={cy} r={r} fill="#A5D6A7" />
+        <circle cx={cx} cy={cy} r={r * 0.42} fill="#66BB6A" />
+        <line x1={cx} y1={cy - r * 0.42} x2={cx} y2={cy - r * 0.8} stroke="#555" strokeWidth={1.2 * rScale} />
+        <polygon points={`${cx},${cy - r * 0.8} ${cx + 7 * rScale},${cy - r * 0.68} ${cx},${cy - r * 0.58}`} fill="#D9534F" />
+        <line x1={cx - r * 0.3} y1={cy} x2={cx + r * 0.3} y2={cy} stroke="rgba(0,0,0,0.12)" strokeWidth={0.8 * rScale} />
+        <line x1={cx} y1={cy - r * 0.3} x2={cx} y2={cy + r * 0.3} stroke="rgba(0,0,0,0.12)" strokeWidth={0.8 * rScale} />
+        {showLabels && (
+          <>
+            <text x={cx} y={cy - r - 2} textAnchor="middle" fontSize={7 * rScale} fill="#666">オーバー</text>
+            <text x={cx} y={cy + r + 9 * rScale} textAnchor="middle" fontSize={7 * rScale} fill="#666">ショート</text>
+            <text x={cx - r - 1} y={cy + 3 * rScale} textAnchor="end" fontSize={7 * rScale} fill="#666">左</text>
+            <text x={cx + r + 1} y={cy + 3 * rScale} textAnchor="start" fontSize={7 * rScale} fill="#666">右</text>
+          </>
+        )}
+        {dots.map((d, i) => (
+          <circle key={i}
+            cx={cx + (d.x - CX) * rScale}
+            cy={cy + (d.y - CY) * rScale}
+            r={dr} fill={d.color} opacity="0.88"
+          />
+        ))}
+      </svg>
+    );
+  }
+
+  // Score sparkline for timeline tab
+  function TimelineScoreLine({ history }) {
+    if (history.length < 2) return null;
+    const W = 280, H = 48, padL = 4, padR = 4, padT = 6, padB = 6;
+    const scores = history.map((h) => h.score);
+    const minS = Math.min(...scores, 40), maxS = Math.max(...scores, 80);
+    const xFor = (i) => padL + (i / (history.length - 1)) * (W - padL - padR);
+    const yFor = (s) => padT + (H - padT - padB) * (1 - (s - minS) / Math.max(1, maxS - minS));
+    const line = history.map((h, i) => `${xFor(i)},${yFor(h.score)}`).join(' ');
+    const area = `${xFor(0)},${H - padB} ${line} ${xFor(history.length - 1)},${H - padB}`;
+    return (
+      <svg width="100%" height={H} viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="timelineFill" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={COLORS.fairway} stopOpacity="0.2" />
+            <stop offset="100%" stopColor={COLORS.fairway} stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        <polygon points={area} fill="url(#timelineFill)" />
+        <polyline points={line} fill="none" stroke={COLORS.fairway} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+        {history.map((h, i) => (
+          <circle key={i} cx={xFor(i)} cy={yFor(h.score)} r="3.5" fill={scoreColor(h.score)} stroke="#fff" strokeWidth="1" />
+        ))}
+      </svg>
+    );
+  }
+
+  return (
+    <div>
+      {/* Distance chips */}
+      <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 12 }}>
+        {entries.map(([dist, counts]) => {
+          const score = counts.score ?? computeDistScore(counts);
+          const isActive = String(activeDist) === dist;
+          return (
+            <button key={dist}
+              onClick={() => { setActiveDist(isActive ? null : Number(dist)); setActiveTab('all'); }}
+              style={{
+                flexShrink: 0, border: 'none', borderRadius: 999,
+                padding: '7px 14px', fontFamily: FONT_STACK,
+                fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                background: isActive ? COLORS.fairway : COLORS.bg,
+                color: isActive ? '#fff' : COLORS.text,
+              }}
+            >
+              {dist}y
+              {score !== null && (
+                <span style={{ marginLeft: 4, fontSize: 11, fontWeight: 600, color: isActive ? 'rgba(255,255,255,0.8)' : scoreColor(score) }}>
+                  {roundScore(score)}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Mini grid (no active selection) */}
+      {activeDist === null && (
+        <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4 }}>
+          {entries.map(([dist, counts]) => {
+            const score = counts.score ?? computeDistScore(counts);
+            return (
+              <div key={dist} style={{ flexShrink: 0, textAlign: 'center', cursor: 'pointer' }} onClick={() => { setActiveDist(Number(dist)); setActiveTab('all'); }}>
+                <MiniGreen counts={counts} size={SIZE} seed={Number(dist)} />
+                <p style={{ margin: '4px 0 0', fontSize: 12, fontWeight: 700, color: COLORS.text }}>{dist}y</p>
+                {score !== null && <p style={{ margin: '1px 0 0', fontSize: 11, color: scoreColor(score), fontWeight: 600 }}>{roundScore(score)}点</p>}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Expanded view */}
+      {activeDist !== null && activeCounts && (
+        <div>
+          {/* Tab switcher */}
+          <div style={{ display: 'flex', background: COLORS.bg, borderRadius: 12, padding: 3, marginBottom: 16 }}>
+            {[{key:'all', label:'全体'}, {key:'timeline', label:'時系列の変化'}].map((tab) => (
+              <button key={tab.key} onClick={() => setActiveTab(tab.key)}
+                style={{
+                  flex: 1, border: 'none', borderRadius: 10, padding: '8px 0',
+                  fontSize: 13, fontWeight: 700, cursor: 'pointer', fontFamily: FONT_STACK,
+                  background: activeTab === tab.key ? COLORS.card : 'transparent',
+                  color: activeTab === tab.key ? COLORS.text : COLORS.mutedDark,
+                  boxShadow: activeTab === tab.key ? '0 1px 2px rgba(0,0,0,0.06)' : 'none',
+                  transition: 'all 0.15s',
+                }}
+              >{tab.label}</button>
+            ))}
+          </div>
+
+          {activeTab === 'all' && (
+            <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+              <MiniGreen counts={activeCounts} size={160} seed={activeDist} showLabels />
+              <div style={{ flex: 1 }}>
+                {DIST_RESULT_TYPES.map((rt) => {
+                  const n = activeCounts[rt.key] || 0;
+                  if (n === 0) return null;
+                  const total = totalDistCount(activeCounts);
+                  return (
+                    <div key={rt.key} style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 7 }}>
+                      <div style={{ width: 10, height: 10, borderRadius: '50%', background: DIST_DOT_COLORS[rt.key], flexShrink: 0 }} />
+                      <span style={{ fontSize: 12, color: COLORS.text, flex: 1 }}>{rt.label}</span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: COLORS.mutedDark }}>{n}球</span>
+                      <span style={{ fontSize: 11, color: COLORS.mutedDark }}>{Math.round(n / total * 100)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'timeline' && (
+            <div>
+              {sessionHistory.length < 2 ? (
+                <p style={{ fontSize: 13, color: COLORS.mutedDark, textAlign: 'center', padding: '16px 0' }}>
+                  時系列を見るには2回以上の記録が必要です
+                </p>
+              ) : (
+                <>
+                  {/* Score trend line */}
+                  <div style={{ marginBottom: 16 }}>
+                    <p style={{ fontSize: 12, color: COLORS.mutedDark, margin: '0 0 6px' }}>スコアの推移</p>
+                    <TimelineScoreLine history={sessionHistory} />
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 2 }}>
+                      <span style={{ fontSize: 10, color: COLORS.mutedDark }}>{sessionHistory[0].label}</span>
+                      <span style={{ fontSize: 10, color: COLORS.mutedDark }}>{sessionHistory[sessionHistory.length - 1].label}</span>
+                    </div>
+                  </div>
+
+                  {/* Per-session landing maps */}
+                  <p style={{ fontSize: 12, color: COLORS.mutedDark, margin: '0 0 10px' }}>セッションごとのランディングゾーン</p>
+                  <div style={{ display: 'flex', gap: 12, overflowX: 'auto', paddingBottom: 4 }}>
+                    {sessionHistory.map((h, idx) => (
+                      <div key={h.date} style={{ flexShrink: 0, textAlign: 'center' }}>
+                        {/* Trend arrow between sessions */}
+                        {idx > 0 && (() => {
+                          const diff = h.score - sessionHistory[idx - 1].score;
+                          const arrow = diff > 2 ? '↑' : diff < -2 ? '↓' : '→';
+                          const color = diff > 2 ? COLORS.fairway : diff < -2 ? COLORS.miss : COLORS.mutedDark;
+                          return null; // arrows shown between items below via label
+                        })()}
+                        <MiniGreen counts={h.counts} size={80} seed={h.date.charCodeAt(8) * 31 + idx} />
+                        <p style={{ margin: '3px 0 0', fontSize: 10.5, fontWeight: 700, color: COLORS.text }}>{h.label}</p>
+                        <p style={{ margin: '1px 0 0', fontSize: 11, fontWeight: 700, color: scoreColor(h.score) }}>
+                          {roundScore(h.score)}点
+                          {idx > 0 && (() => {
+                            const diff = h.score - sessionHistory[idx - 1].score;
+                            if (Math.abs(diff) < 1) return null;
+                            return <span style={{ fontSize: 10, marginLeft: 2, color: diff > 0 ? COLORS.fairway : COLORS.miss }}>{diff > 0 ? `+${Math.round(diff)}` : Math.round(diff)}</span>;
+                          })()}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Trend summary */}
+                  {sessionHistory.length >= 2 && (() => {
+                    const first = sessionHistory[0].score;
+                    const last = sessionHistory[sessionHistory.length - 1].score;
+                    const diff = last - first;
+                    const improving = diff > 3;
+                    const declining = diff < -3;
+                    return (
+                      <div style={{ marginTop: 14, padding: '10px 12px', background: improving ? COLORS.accentSoft : declining ? COLORS.missSoft : COLORS.bg, borderRadius: 12 }}>
+                        <p style={{ fontSize: 12, margin: 0, color: COLORS.text, lineHeight: 1.6 }}>
+                          {improving
+                            ? `初回から${Math.round(diff)}点アップ!${activeDist}yの精度が着実に上がってきてる`
+                            : declining
+                            ? `最近${activeDist}yのスコアが少し落ちてきてる。次の練習でここを重点的に`
+                            : `${activeDist}yは安定して練習できてる。このままコツコツ続けよう`}
+                        </p>
+                      </div>
+                    );
+                  })()}
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function Sparkline({ scores }) {
   if (!scores || scores.length < 2) return null;
   const w = 96, h = 34, pad = 3;
@@ -895,9 +1284,10 @@ function App() {
   const [loaded, setLoaded] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [customClubs, setCustomClubs] = useState([]);
-  const [screen, setScreen] = useState('home'); // home | select | input | result | history
+  const [screen, setScreen] = useState('home'); // home | select | input | distInput | result | history
   const [currentSession, setCurrentSession] = useState(null);
   const [selectedClub, setSelectedClub] = useState(null);
+  const [selectedDistance, setSelectedDistance] = useState(null);
   const [homeMetric, setHomeMetric] = useState('overall');
   const [confirmState, setConfirmState] = useState(null);
   const [sameDayState, setSameDayState] = useState(null);
@@ -934,6 +1324,19 @@ function App() {
 
   const allClubTendencyCounts = useMemo(() => aggregateAllClubs(sessions), [sessions]);
 
+  const allDistCounts = useMemo(() => {
+    const map = {};
+    sessions.forEach((s) => {
+      Object.entries(s.distances || {}).forEach(([dist, c]) => {
+        if (!map[dist]) map[dist] = emptyDistCounts();
+        DIST_RESULT_TYPES.forEach((t) => { map[dist][t.key] += c[t.key] || 0; });
+        // carry computed score for display
+        const score = computeDistScore(map[dist]);
+        if (score !== null) map[dist].score = score;
+      });
+    });
+    return map;
+  }, [sessions]);
   const chartData = useMemo(() => {
     let filtered;
     if (homeMetric === 'overall') {
@@ -960,8 +1363,9 @@ function App() {
   }
 
   function startPractice() {
-    setCurrentSession({ date: todayISO(), clubs: {} });
+    setCurrentSession({ date: todayISO(), clubs: {}, distances: {} });
     setSelectedClub(null);
+    setSelectedDistance(null);
     setScreen('select');
   }
 
@@ -974,11 +1378,30 @@ function App() {
     setScreen('input');
   }
 
+  function selectDistance(dist) {
+    setSelectedDistance(dist);
+    setCurrentSession((prev) => {
+      const key = String(dist);
+      if (prev.distances && prev.distances[key]) return prev;
+      return { ...prev, distances: { ...(prev.distances || {}), [key]: emptyDistCounts() } };
+    });
+    setScreen('distInput');
+  }
+
   function updateCount(club, key, delta) {
     setCurrentSession((prev) => {
       const counts = { ...(prev.clubs[club] || emptyCounts()) };
       counts[key] = Math.max(0, (counts[key] || 0) + delta);
       return { ...prev, clubs: { ...prev.clubs, [club]: counts } };
+    });
+  }
+
+  function updateDistCount(dist, key, delta) {
+    setCurrentSession((prev) => {
+      const dkey = String(dist);
+      const counts = { ...((prev.distances && prev.distances[dkey]) || emptyDistCounts()) };
+      counts[key] = Math.max(0, (counts[key] || 0) + delta);
+      return { ...prev, distances: { ...(prev.distances || {}), [dkey]: counts } };
     });
   }
 
@@ -990,10 +1413,17 @@ function App() {
           clubsWithScores[club] = { ...counts, score: computeClubScore(counts) };
         }
       });
-      return { ...prev, clubs: clubsWithScores };
+      const distancesWithScores = {};
+      Object.entries(prev.distances || {}).forEach(([dist, counts]) => {
+        if (totalDistCount(counts) > 0) {
+          distancesWithScores[dist] = { ...counts, score: computeDistScore(counts) };
+        }
+      });
+      return { ...prev, clubs: clubsWithScores, distances: distancesWithScores };
     });
     setScreen('result');
   }
+
 
   function saveSession() {
     const existing = sessions.find((s) => s.date === currentSession.date);
@@ -1020,25 +1450,28 @@ function App() {
       id: Date.now(),
       date: currentSession.date,
       clubs: currentSession.clubs,
+      distances: currentSession.distances || {},
       overallScore,
     };
     persistSessions([...sessions, newSession]);
     setCurrentSession(null);
     setSelectedClub(null);
+    setSelectedDistance(null);
     setSameDayState(null);
     setScreen('home');
   }
 
   // Combines currentSession into the existing same-day session, summing raw
-  // shot counts per club and recomputing scores from the combined totals.
+  // shot counts per club/distance and recomputing scores from the combined totals.
   // When sameDayState.movingSession is set, this instead finalizes a history
   // date edit by merging the moved session into the existing one on that date.
   function commitMergedSession(existing) {
     if (sameDayState && sameDayState.movingSession) {
       const { movingSession } = sameDayState;
       const mergedClubs = mergeClubResults(existing.clubs, movingSession.clubs);
+      const mergedDistances = mergeDistResults(existing.distances || {}, movingSession.distances || {});
       const overallScore = computeOverallScore(mergedClubs);
-      const updated = { ...existing, clubs: mergedClubs, overallScore };
+      const updated = { ...existing, clubs: mergedClubs, distances: mergedDistances, overallScore };
       persistSessions(
         sessions
           .filter((s) => s.id !== movingSession.id)
@@ -1048,11 +1481,13 @@ function App() {
       return;
     }
     const mergedClubs = mergeClubResults(existing.clubs, currentSession.clubs);
+    const mergedDistances = mergeDistResults(existing.distances || {}, currentSession.distances || {});
     const overallScore = computeOverallScore(mergedClubs);
-    const updated = { ...existing, clubs: mergedClubs, overallScore };
+    const updated = { ...existing, clubs: mergedClubs, distances: mergedDistances, overallScore };
     persistSessions(sessions.map((s) => (s.id === existing.id ? updated : s)));
     setCurrentSession(null);
     setSelectedClub(null);
+    setSelectedDistance(null);
     setSameDayState(null);
     setScreen('home');
   }
@@ -1064,6 +1499,7 @@ function App() {
       onConfirm: () => {
         setCurrentSession(null);
         setSelectedClub(null);
+        setSelectedDistance(null);
         setConfirmState(null);
         setScreen('home');
       },
@@ -1121,7 +1557,8 @@ function App() {
   }
 
   const anyDoneInSession = currentSession
-    ? Object.values(currentSession.clubs).some((c) => totalCount(c) > 0)
+    ? Object.values(currentSession.clubs).some((c) => totalCount(c) > 0) ||
+      Object.values(currentSession.distances || {}).some((c) => totalDistCount(c) > 0)
     : false;
 
   // ---------- screens ----------
@@ -1177,6 +1614,18 @@ function App() {
                 <RingLabel>クラブ × ミスの内訳</RingLabel>
                 <div style={cardStyle}>
                   <ClubTendencyHeatmap clubCounts={allClubTendencyCounts} />
+                </div>
+              </>
+            )}
+
+            {allDistCounts && Object.keys(allDistCounts).length > 0 && (
+              <>
+                <RingLabel>距離別 ランディングゾーン</RingLabel>
+                <div style={cardStyle}>
+                  <p style={{ fontSize: 12, color: COLORS.mutedDark, margin: '0 0 12px' }}>
+                    距離をタップすると、ショットがどこに落ちやすいか詳しく見られます
+                  </p>
+                  <DistanceTendencyMap distCounts={allDistCounts} sessions={sessions} />
                 </div>
               </>
             )}
@@ -1257,6 +1706,46 @@ function App() {
               <button onClick={addCustomClub} style={{ ...primaryButton, width: 'auto', padding: '10px 16px' }}>追加</button>
             </div>
           )}
+
+          {/* Distance section divider */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, margin: '22px 0 14px' }}>
+            <div style={{ flex: 1, height: 1, background: COLORS.border }} />
+            <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.mutedDark, letterSpacing: 0.4, textTransform: 'uppercase' }}>距離で記録</span>
+            <div style={{ flex: 1, height: 1, background: COLORS.border }} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
+            {DISTANCE_PRESETS.map((dist) => {
+              const dkey = String(dist);
+              const done = currentSession.distances && currentSession.distances[dkey] && totalDistCount(currentSession.distances[dkey]) > 0;
+              return (
+                <button
+                  key={dist}
+                  onClick={() => selectDistance(dist)}
+                  style={{
+                    position: 'relative',
+                    border: 'none',
+                    borderRadius: 14,
+                    background: done ? '#E8F4EC' : COLORS.card,
+                    color: done ? '#2E7D55' : COLORS.text,
+                    padding: '13px 4px',
+                    fontSize: 14,
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                    fontFamily: FONT_STACK,
+                    boxShadow: '0 1px 2px rgba(0,0,0,0.04)',
+                    textAlign: 'center',
+                  }}
+                >
+                  {dist}y
+                  {done && (
+                    <span style={{ position: 'absolute', top: -6, right: -6, background: COLORS.fairway, borderRadius: '50%', width: 20, height: 20, display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 1px 3px rgba(0,0,0,0.15)' }}>
+                      <IconCheck size={12} color="#fff" />
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <div style={{ padding: '24px 20px 24px' }}>
@@ -1365,11 +1854,113 @@ function App() {
     );
   }
 
+  function renderDistInput() {
+    if (!currentSession || selectedDistance === null) return null;
+    const dkey = String(selectedDistance);
+    const counts = (currentSession.distances && currentSession.distances[dkey]) || emptyDistCounts();
+    const total = totalDistCount(counts);
+
+    // Past scores for this distance across all sessions
+    const pastScores = sessions
+      .filter((s) => s.distances && s.distances[dkey])
+      .map((s) => s.distances[dkey].score);
+    const avg = pastScores.length ? pastScores.reduce((a, b) => a + b, 0) / pastScores.length : null;
+    const last = pastScores.length ? pastScores[pastScores.length - 1] : null;
+
+    return (
+      <>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px 4px' }}>
+          <button onClick={() => setScreen('select')} style={iconBtnStyle}><IconChevronLeft size={24} /></button>
+          <p style={{ fontSize: 13, color: COLORS.mutedDark, margin: 0 }}>目安 5〜10球</p>
+          <button onClick={requestCancelPractice} style={iconBtnStyle}><IconX size={22} /></button>
+        </div>
+
+        <div style={{ padding: '8px 20px 16px' }}>
+          <p style={{ fontFamily: FONT_STACK, fontSize: 28, fontWeight: 700, letterSpacing: -0.5, margin: '4px 0', color: COLORS.text }}>{selectedDistance}y</p>
+        </div>
+
+        <RingLabel>これまでの成績</RingLabel>
+        <div style={cardStyle}>
+          {pastScores.length === 0 ? (
+            <p style={{ fontSize: 13, color: COLORS.mutedDark, margin: '0 0 12px' }}>まだ記録がありません。今回が最初の記録です。</p>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingBottom: 10 }}>
+              <Sparkline scores={pastScores} />
+              <div style={{ textAlign: 'right' }}>
+                <p style={{ margin: 0, fontSize: 12, color: COLORS.mutedDark }}>平均 <span style={{ fontFamily: FONT_ROUNDED, fontWeight: 700, fontSize: 16, color: COLORS.text }}>{roundScore(avg)}</span>点</p>
+                <p style={{ margin: '4px 0 0', fontSize: 12, color: COLORS.mutedDark }}>前回 <span style={{ fontFamily: FONT_ROUNDED, fontWeight: 700, fontSize: 16, color: COLORS.text }}>{roundScore(last)}</span>点</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{ padding: '0 20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            {DIST_RESULT_TYPES.map((rt) => {
+              const isNice = rt.key === 'nice';
+              const count = counts[rt.key] || 0;
+              return (
+                <button
+                  key={rt.key}
+                  onClick={() => updateDistCount(selectedDistance, rt.key, 1)}
+                  style={{
+                    position: 'relative',
+                    border: 'none',
+                    borderRadius: 16,
+                    background: isNice ? COLORS.fairway : COLORS.card,
+                    color: isNice ? '#fff' : COLORS.text,
+                    padding: '16px 8px',
+                    cursor: 'pointer',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    gap: 4,
+                    fontFamily: FONT_STACK,
+                    boxShadow: isNice ? 'none' : '0 1px 2px rgba(0,0,0,0.04)',
+                  }}
+                >
+                  <span style={{ fontSize: 12, fontWeight: 600 }}>{rt.label}</span>
+                  <span style={{ fontFamily: FONT_ROUNDED, fontSize: 28, fontWeight: 700, lineHeight: 1.1, color: isNice ? '#fff' : (count > 0 ? COLORS.fairway : COLORS.text) }}>{count}</span>
+                  {count > 0 && (
+                    <span
+                      onClick={(e) => { e.stopPropagation(); updateDistCount(selectedDistance, rt.key, -1); }}
+                      style={{ position: 'absolute', top: 8, right: 8, width: 22, height: 22, borderRadius: '50%', background: isNice ? 'rgba(255,255,255,0.25)' : 'rgba(60,60,67,0.08)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                    >
+                      <IconMinus size={12} color={isNice ? '#fff' : COLORS.text} />
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+          <p style={{ fontSize: 12, color: COLORS.mutedDark, textAlign: 'center', margin: '14px 0 0' }}>合計 {total} 球</p>
+        </div>
+
+        <div style={{ padding: '20px 20px 24px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <button onClick={() => setScreen('select')} style={secondaryButton}>次へ</button>
+          <button
+            onClick={finishPractice}
+            disabled={!anyDoneInSession}
+            style={{ ...primaryButton, opacity: anyDoneInSession ? 1 : 0.4, cursor: anyDoneInSession ? 'pointer' : 'default' }}
+          >
+            練習を終える
+          </button>
+        </div>
+      </>
+    );
+  }
+
   function renderResult() {
     if (!currentSession) return null;
     const clubEntries = Object.entries(currentSession.clubs);
-    const overall = clubEntries.length
-      ? clubEntries.reduce((sum, [, c]) => sum + c.score, 0) / clubEntries.length
+    const distEntries = Object.entries(currentSession.distances || {})
+      .sort((a, b) => Number(a[0]) - Number(b[0]));
+    const allEntries = [
+      ...clubEntries.map(([k, v]) => ({ key: k, label: k, score: v.score })),
+      ...distEntries.map(([k, v]) => ({ key: `d_${k}`, label: `${k}y`, score: v.score })),
+    ];
+    const overall = allEntries.length
+      ? allEntries.reduce((sum, e) => sum + e.score, 0) / allEntries.length
       : 0;
     const altoState = getResultAltoState(currentSession);
 
@@ -1391,15 +1982,33 @@ function App() {
           <SpeechBubble>{altoState.message}</SpeechBubble>
         </div>
 
-        <RingLabel>クラブ別スコア</RingLabel>
-        <div style={cardStyle}>
-          {clubEntries.map(([club, c], i) => (
-            <div key={club} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: i < clubEntries.length - 1 ? `1px solid ${COLORS.border}` : 'none' }}>
-              <span style={{ fontSize: 15, fontWeight: 500 }}>{club}</span>
-              <span style={{ fontFamily: FONT_ROUNDED, fontSize: 17, fontWeight: 700, color: scoreColor(c.score) }}>{roundScore(c.score)}<span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2, color: COLORS.mutedDark }}>点</span></span>
+        {clubEntries.length > 0 && (
+          <>
+            <RingLabel>クラブ別スコア</RingLabel>
+            <div style={cardStyle}>
+              {clubEntries.map(([club, c], i) => (
+                <div key={club} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: i < clubEntries.length - 1 ? `1px solid ${COLORS.border}` : 'none' }}>
+                  <span style={{ fontSize: 15, fontWeight: 500 }}>{club}</span>
+                  <span style={{ fontFamily: FONT_ROUNDED, fontSize: 17, fontWeight: 700, color: scoreColor(c.score) }}>{roundScore(c.score)}<span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2, color: COLORS.mutedDark }}>点</span></span>
+                </div>
+              ))}
             </div>
-          ))}
-        </div>
+          </>
+        )}
+
+        {distEntries.length > 0 && (
+          <>
+            <RingLabel>距離別スコア</RingLabel>
+            <div style={cardStyle}>
+              {distEntries.map(([dist, c], i) => (
+                <div key={dist} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '11px 0', borderBottom: i < distEntries.length - 1 ? `1px solid ${COLORS.border}` : 'none' }}>
+                  <span style={{ fontSize: 15, fontWeight: 500 }}>{dist}y</span>
+                  <span style={{ fontFamily: FONT_ROUNDED, fontSize: 17, fontWeight: 700, color: scoreColor(c.score) }}>{roundScore(c.score)}<span style={{ fontSize: 12, fontWeight: 400, marginLeft: 2, color: COLORS.mutedDark }}>点</span></span>
+                </div>
+              ))}
+            </div>
+          </>
+        )}
 
         <div style={{ padding: '8px 20px 24px' }}>
           <button onClick={saveSession} style={primaryButton}>保存する</button>
@@ -1551,6 +2160,7 @@ function App() {
       {screen === 'home' && renderHome()}
       {screen === 'select' && renderSelect()}
       {screen === 'input' && renderInput()}
+      {screen === 'distInput' && renderDistInput()}
       {screen === 'result' && renderResult()}
       {screen === 'history' && renderHistory()}
 
