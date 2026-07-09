@@ -438,37 +438,33 @@ function generateAltoSummary() {
   const seed = weekSeed();
   const now = new Date();
 
-  // Generate 20 sessions over the past ~5 months at roughly weekly intervals,
-  // using a random-walk so scores drift naturally up and down.
+  // 20 sessions going backward from 4-7 days ago, spaced 5-10 days apart
+  // This guarantees the most recent session is always in the past (4-7 days ago)
+  const latestOffset = 4 + Math.round(seededRand(seed, 77) * 3); // 4-7 days ago
   const sessions = [];
-  // Start from ~150 days ago, spaced 5–10 days apart
-  let daysAgo = 148;
-  let score = 68 + Math.round(seededRand(seed, 0) * 14);   // starting score 68-82
-  let rate  = 0.48 + seededRand(seed, 1) * 0.18;           // starting nice rate 48-66%
+  let daysAgo = latestOffset;
+  let score = 68 + Math.round(seededRand(seed, 0) * 14);
+  let rate  = 0.48 + seededRand(seed, 1) * 0.18;
 
   for (let i = 0; i < 20; i++) {
     const d = new Date(now);
     d.setDate(d.getDate() - Math.round(daysAgo));
     const dateStr = d.toISOString().slice(0, 10);
-
     sessions.push({ date: dateStr, score: Math.round(score), rate: Math.round(rate * 100) / 100 });
 
-    // Random walk with different seed mixing to avoid monotone streaks
     const scoreDelta = (seededRand(seed ^ (i * 31337), i + 100) - 0.5) * 14;
     score = Math.min(92, Math.max(58, score + scoreDelta));
-
     const rateDelta = (seededRand(seed ^ (i * 19867), i + 200) - 0.5) * 0.12;
     rate = Math.min(0.85, Math.max(0.38, rate + rateDelta));
 
-    // Gap between sessions: 5–10 days
-    daysAgo -= 5 + Math.round(seededRand(seed, i * 5 + 4) * 5);
+    // Go further back: 5-10 days per step
+    daysAgo += 5 + Math.round(seededRand(seed, i * 5 + 4) * 5);
   }
 
   sessions.sort((a, b) => a.date.localeCompare(b.date));
   const overallScores = sessions.map(({ date, score }) => ({ date, score }));
   const niceRates     = sessions.map(({ date, rate })  => ({ date, rate }));
 
-  // Hot club — weekly rotation
   const altoClubs = ['7I', '8I', 'AW', 'ドライバー', '9I', 'SW', 'UT'];
   const hotClubName = altoClubs[Math.floor(seededRand(seed, 999) * altoClubs.length)];
   const hotClubRate = 0.55 + seededRand(seed, 998) * 0.28;
@@ -1128,9 +1124,14 @@ function ScoreAreaChart({ data, height = 190 }) {
           <text key={v} x={padL - 6} y={yFor(v) + 3} fontSize="9" fill={COLORS.mutedDark} textAnchor="end">{v}</text>
         ))}
 
-        {data.map((d, i) => (
-          <text key={i} x={xFor(i)} y={H - 6} fontSize="9" fill={COLORS.mutedDark} textAnchor="middle">{d.label}</text>
-        ))}
+        {data.map((d, i) => {
+          // Show at most 5 labels: always show first and last, thin out the rest
+          const maxLabels = 5;
+          const step = Math.ceil(n / (maxLabels - 1));
+          const show = i === 0 || i === n - 1 || i % step === 0;
+          if (!show) return null;
+          return <text key={i} x={xFor(i)} y={H - 6} fontSize="9" fill={COLORS.mutedDark} textAnchor="middle">{d.label}</text>;
+        })}
 
         <polygon points={areaPoints} fill="url(#fairwayFill)" />
         <polyline points={linePoints} fill="none" stroke={COLORS.fairway} strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
