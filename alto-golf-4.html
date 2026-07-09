@@ -169,6 +169,14 @@ function IconPerson({ size = 20, strokeWidth = 2.2 }) {
     </svg>
   );
 }
+function IconShare({ size = 20, strokeWidth = 2.2 }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round">
+      <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+      <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  );
+}
 function IconGearSimple({ size = 20, strokeWidth = 2.2 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round">
@@ -2047,6 +2055,7 @@ function App() {
   const [friendsLoading, setFriendsLoading] = useState(false);
   const [selectedFriend, setSelectedFriend] = useState(null);
   const [showAllUsers, setShowAllUsers] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
   // Comments
   const [friendComments, setFriendComments] = useState({}); // { [nickname]: [comments] }
   const [commentDraft, setCommentDraft] = useState('');
@@ -2203,6 +2212,22 @@ function App() {
     setAvatarId(newAvatarId);
     await saveKey('user-avatar', newAvatarId);
     setShowAvatarPicker(false);
+  }
+
+  function copyAppLink() {
+    const url = window.location.href;
+    const done = () => { setLinkCopied(true); setTimeout(() => setLinkCopied(false), 2000); };
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(url).then(done).catch(() => {
+        const el = document.createElement('textarea');
+        el.value = url; document.body.appendChild(el); el.select();
+        document.execCommand('copy'); document.body.removeChild(el); done();
+      });
+    } else {
+      const el = document.createElement('textarea');
+      el.value = url; document.body.appendChild(el); el.select();
+      document.execCommand('copy'); document.body.removeChild(el); done();
+    }
   }
 
   async function loadFriends() {
@@ -3235,6 +3260,12 @@ function App() {
           <p style={{ fontFamily: FONT_STACK, fontSize: 30, letterSpacing: -0.5, fontWeight: 700, margin: 0, color: COLORS.text }}>仲間</p>
           <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
             <button onClick={() => { loadFriends(); }} style={{ border: 'none', background: COLORS.bg, borderRadius: 10, padding: '8px 12px', fontSize: 13, fontWeight: 600, cursor: 'pointer', fontFamily: FONT_STACK, color: COLORS.accent }}>更新</button>
+            <button onClick={copyAppLink} style={{ ...iconBtnStyle, position: 'relative', color: linkCopied ? COLORS.fairway : COLORS.text }} title="招待リンクをコピー">
+              {linkCopied
+                ? <svg width={22} height={22} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                : <IconShare size={22} strokeWidth={2.2} />
+              }
+            </button>
             <button onClick={() => { loadFriends(); setShowAllUsers(true); }} style={iconBtnStyle}>
               <IconPerson size={24} strokeWidth={2.2} />
             </button>
